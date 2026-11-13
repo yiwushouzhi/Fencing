@@ -3,6 +3,8 @@ import { FencingGame } from './game/FencingGame';
 import type { GameSnapshot } from './game/FencingGame';
 import { AI_INFO, WEAPON_INFO } from './game/types';
 import type { AIStyle, CombatEvent, Difficulty, MatchConfig, Weapon } from './game/types';
+import type { CombatPreset } from './game/combatConfig';
+import { COMBAT_PRESET_INFO } from './game/combatConfig';
 
 const icon = (name: 'sound' | 'mute' | 'arrow' | 'eye' | 'close' | 'restart' | 'play' | 'help') => {
   const paths = {
@@ -86,6 +88,15 @@ app.innerHTML = `
             <button class="selected" data-difficulty="advanced">进阶</button>
             <button data-difficulty="master">大师</button>
           </div>
+        </div>
+        <div class="setup-section preset-section">
+          <label><span>体感预设</span><small>FEELING</small></label>
+          <div class="segmented preset-segments" id="preset-options">
+            <button data-preset="tight" class="selected"><small>RÉALIST</small>硬核写实</button>
+            <button data-preset="balanced"><small>BALANCÉ</small>竞技平衡</button>
+            <button data-preset="loose"><small>DÉTENDU</small>轻松上手</button>
+          </div>
+          <p id="preset-description">弓步惩罚重，前冲 0.82m、恢复 0.69s。适合硬核模拟。</p>
         </div>
         <div class="setup-footer-options">
           <label class="assist-toggle"><input type="checkbox" id="assists-toggle" checked><span class="toggle-track"><i></i></span><span>距离辅助<small>DISTANCE ASSIST</small></span></label>
@@ -293,6 +304,19 @@ document.querySelectorAll<HTMLButtonElement>('[data-difficulty]').forEach((butto
   selectButton('[data-difficulty]', button);
 }));
 $('#assists-toggle').addEventListener('change', (event) => { config.assists = (event.target as HTMLInputElement).checked; });
+
+let preset: CombatPreset = 'tight';
+function updatePresetInfo() {
+  const info = COMBAT_PRESET_INFO[preset];
+  $('#preset-description').textContent = info.description;
+}
+document.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((button) => button.addEventListener('click', () => {
+  preset = button.dataset.preset as CombatPreset;
+  selectButton('[data-preset]', button);
+  updatePresetInfo();
+  game.setPreset(preset);
+}));
+updatePresetInfo();
 document.querySelectorAll<HTMLButtonElement>('[data-score]').forEach((button) => button.addEventListener('click', () => {
   config.targetScore = Number(button.dataset.score);
   selectButton('[data-score]', button);
@@ -307,6 +331,7 @@ function startMatch() {
   $('#help-screen').classList.add('hidden');
   $('#hud').classList.remove('hidden');
   document.body.classList.add('in-match');
+  game.setPreset(preset);
   game.startMatch(config);
 }
 

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { Arena, FencerVisual } from './visuals';
 import { FencingAudio } from './audio';
 import { PARRY_NAMES, WEAPON_INFO } from './types';
+import { CombatConfig, type CombatPreset } from './combatConfig';
 import type { ActionState, AIStyle, CombatEvent, Difficulty, FencerSnapshot, GamePhase, MatchConfig, Side, ViewMode, Weapon } from './types';
 
 export interface GameSnapshot {
@@ -17,6 +18,7 @@ export interface GameSnapshot {
   parry: number;
   stats: { hits: number; parries: number; attacks: number };
   overtime: boolean;
+  preset: CombatPreset;
 }
 
 interface Fencer {
@@ -58,6 +60,7 @@ export class FencingGame {
   readonly scene = new THREE.Scene();
   readonly camera = new THREE.PerspectiveCamera(54, 1, 0.045, 90);
   readonly audio = new FencingAudio();
+  readonly combatConfig = new CombatConfig('tight');
   config: MatchConfig = { weapon: 'foil', style: 'counter', difficulty: 'advanced', assists: true, targetScore: 15 };
   phase: GamePhase = 'menu';
   view: ViewMode = 'third';
@@ -276,8 +279,9 @@ export class FencingGame {
   };
 
   private resetPositions() {
+    const half = this.combatConfig.params.startingGap / 2;
     for (const fencer of [this.player, this.ai]) {
-      fencer.position.set(0, 0, fencer.side === 'player' ? 2.2 : -2.2);
+      fencer.position.set(0, 0, fencer.side === 'player' ? half : -half);
       fencer.aim = { x: 0, y: 0 };
       fencer.action = idleAction();
       fencer.parry = 4;
@@ -293,6 +297,10 @@ export class FencingGame {
     }
     this.pendingHits = [];
     this.arena.setScoreLights('off', 'off');
+  }
+
+  setPreset(preset: CombatPreset) {
+    this.combatConfig.setPreset(preset);
   }
 
   private beginPhase(phase: GamePhase, duration: number) {
@@ -315,6 +323,7 @@ export class FencingGame {
 
   private startHalfstep(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
+    const p = this.combatConfig.params;
     const backward = fencer.side === 'player' && this.keys.has('KeyS');
     fencer.action = { ...idleAction(), type: 'halfstep', duration: 0.2 };
     fencer.moveDirection = backward ? -1 : 1;
@@ -331,7 +340,8 @@ export class FencingGame {
 
   private startFeint(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
-    fencer.action = { ...idleAction(), type: 'feint', duration: 0.48, startAimX: fencer.aim.x, startAimY: fencer.aim.y, isFeint: true };
+    const p = this.combatConfig.params;
+    fencer.action = { ...idleAction(), type: 'feint', duration: p.feintDuration, startAimX: fencer.aim.x, startAimY: fencer.aim.y, isFeint: true };
     if (this.config.weapon !== 'epee' && !this.priority) this.setPriority(fencer.side);
     this.audio.swish();
     this.emit('action', fencer.side, 'Feint', '佯攻 · 左键衔接转移进攻');
@@ -340,13 +350,14 @@ export class FencingGame {
   private startPrise(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
     const opponent = this.opponent(fencer);
+    const p = this.combatConfig.params;
     const bladeDistance = this.segmentDistance(fencer.bladeBase, fencer.bladeTip, opponent.bladeBase, opponent.bladeTip);
-    if (bladeDistance > 0.38 || this.bodyDistance() > 2.5) {
+    if (bladeDistance > p.priseBladeMaxDistance || this.bodyDistance() > p.priseMaxBodyDistance) {
       this.emit('blade', fencer.side, 'Prise de fer · 未贴剑', '靠近并让双方剑刃接触');
       fencer.action = { ...idleAction(), type: 'parry', duration: 0.28, parry: fencer.parry };
       return;
     }
-    fencer.action = { ...idleAction(), type: 'prise', duration: 0.58 };
+    fencer.action = { ...idleAction(), type: 'prise', duration: p.priseDuration };
     opponent.aim.x += fencer.side === 'player' ? 0.4 : -0.4;
     this.audio.blade();
     this.emit('blade', fencer.side, 'Prise de fer', 'Croisé · 剑刃控制成功，左键进攻');
@@ -354,28 +365,32 @@ export class FencingGame {
 
   private startParry(fencer: Fencer, forcedParry?: number) {
     if (!this.canAct(fencer) && fencer.action.type !== 'feint') return;
+    const p = this.combatConfig.params;
     const parry = forcedParry ?? this.parryFromAim(fencer.aim.x, fencer.aim.y);
     fencer.parry = parry;
     this.setAimForParry(fencer, parry);
-    fencer.action = { ...idleAction(), type: 'parry', duration: 0.43, parry };
+    fencer.action = { ...idleAction(), type: 'parry', duration: p.parryDuration, parry };
     this.emit('action', fencer.side, `Parry ${parry}`, PARRY_NAMES[parry - 1]);
   }
 
   private startAttack(fencer: Fencer, kind: 'attack' | 'lunge' | 'fleche') {
     const current = fencer.action;
+    const p = this.combatConfig.params;
     const canChainFeint = current.type === 'feint' && current.elapsed > 0.1;
     const canChainPrise = current.type === 'prise';
     const canChainBallestra = current.type === 'ballestra' && current.elapsed > 0.2;
-    const recovery = this.isAttacking(fencer) && current.elapsed > current.hitAt + 0.16 && current.elapsed < current.duration;
+    const recovery = this.isAttacking(fencer) && current.elapsed > current.hitAt + p.remiseWindow && current.elapsed < current.duration;
     if (!this.canAct(fencer) && !canChainFeint && !canChainPrise && !canChainBallestra && !recovery) return;
     if (kind === 'fleche' && current.type !== 'idle' && !this.canAct(fencer)) return;
 
     const sinceParry = this.elapsed - fencer.lastParry;
-    const isRiposte = sinceParry < 1.05;
+    const isRiposte = sinceParry < p.riposteWindow;
     const isRemise = recovery || this.elapsed - fencer.lastAttackEnd < 0.24;
     const disengaged = canChainFeint || Math.abs(fencer.aim.x - fencer.lastAimX) > 0.45;
-    const duration = kind === 'lunge' ? 0.92 : kind === 'fleche' ? 1.04 : isRiposte ? 0.56 : 0.68;
-    const hitAt = kind === 'lunge' ? 0.22 : kind === 'fleche' ? 0.28 : isRiposte ? 0.13 : 0.17;
+    let duration: number, hitAt: number;
+    if (kind === 'lunge') { duration = p.lungeDuration; hitAt = p.lungeHitAt; }
+    else if (kind === 'fleche') { duration = p.flecheDuration; hitAt = p.flecheHitAt; }
+    else { duration = isRiposte ? p.thrustDurationFast : p.thrustDurationSlow; hitAt = isRiposte ? p.thrustHitAtFast : p.thrustHitAtSlow; }
     fencer.action = {
       type: kind, elapsed: 0, duration, hitAt, hasHit: false,
       attackLine: this.parryFromAim(fencer.aim.x, fencer.aim.y), startAimX: fencer.aim.x, startAimY: fencer.aim.y,
@@ -434,15 +449,17 @@ export class FencingGame {
     fencer.position.z += sign * direction * amount;
     fencer.position.z = clamp(fencer.position.z, -6.65, 6.65);
     const distance = this.bodyDistance();
-    if (distance < 0.64) {
+    const minGap = this.combatConfig.params.minBodyGap;
+    if (distance < minGap) {
       const midpoint = (this.player.position.z + this.ai.position.z) / 2;
-      this.player.position.z = midpoint + 0.32;
-      this.ai.position.z = midpoint - 0.32;
+      this.player.position.z = midpoint + minGap / 2;
+      this.ai.position.z = midpoint - minGap / 2;
     }
   }
 
   private updatePlayer(dt: number) {
     const fencer = this.player;
+    const p = this.combatConfig.params;
     if (!this.canAct(fencer)) return;
     let direction = 0;
     if (this.keys.has('KeyW')) direction += 1;
@@ -452,13 +469,14 @@ export class FencingGame {
     fencer.position.x = clamp(fencer.position.x + lateral * dt * 0.42, -0.55, 0.55);
     if (this.keys.has('KeyV')) {
       fencer.action.type = 'glissade';
-      this.move(fencer, direction, dt * 0.86);
+      this.move(fencer, direction, dt * p.glissadeSpeed);
     } else if (direction) {
       const nextType = direction > 0 ? 'advance' : 'retreat';
       if (fencer.action.type !== nextType) this.audio.step();
       fencer.action.type = nextType;
       fencer.moveDirection = direction;
-      this.move(fencer, direction, dt * 1.32);
+      const speed = direction > 0 ? p.advanceSpeed : p.retreatSpeed;
+      this.move(fencer, direction, dt * speed);
     } else if (['advance', 'retreat', 'glissade'].includes(fencer.action.type)) {
       fencer.action = idleAction();
     }
@@ -477,17 +495,18 @@ export class FencingGame {
     const ai = this.ai;
     const player = this.player;
     const params = this.aiParameters();
+    const p = this.combatConfig.params;
     ai.thinkIn -= dt;
     if (ai.action.type === 'feint' && ai.action.elapsed > 0.24) {
       ai.aim.x = player.action.type === 'parry' ? -player.aim.x : (Math.random() > 0.5 ? 0.45 : -0.4);
       ai.lastAimX = -ai.aim.x;
-      this.startAttack(ai, this.bodyDistance() > 1.9 ? 'lunge' : 'attack');
+      this.startAttack(ai, this.bodyDistance() > p.lungeThreshold ? 'lunge' : 'attack');
       return;
     }
     if (ai.thinkIn > 0) return;
     ai.thinkIn = params.reaction * (0.8 + Math.random() * 0.45);
     const distance = this.bodyDistance();
-    const playerThreat = this.isAttacking(player) && player.action.elapsed < player.action.hitAt + 0.13 && distance < 3.15;
+    const playerThreat = this.isAttacking(player) && player.action.elapsed < player.action.hitAt + 0.13 && distance < p.aiThreatSense;
     const playerOpen = (this.isAttacking(player) && player.action.elapsed > player.action.hitAt + 0.18) || player.action.type === 'ballestra';
 
     if (playerThreat && this.canAct(ai)) {
@@ -504,27 +523,27 @@ export class FencingGame {
     }
     if (!this.canAct(ai)) return;
 
-    if (this.elapsed - ai.lastParry < 0.82 && distance < 2.3) {
+    if (this.elapsed - ai.lastParry < 0.82 && distance < p.threatThreshold) {
       this.startAttack(ai, 'attack');
       return;
     }
-    if (playerOpen && distance < 3.15) {
-      this.startAttack(ai, distance > 1.9 ? 'lunge' : 'attack');
+    if (playerOpen && distance < p.aiOpenSense) {
+      this.startAttack(ai, distance > p.lungeThreshold ? 'lunge' : 'attack');
       return;
     }
 
     const roll = Math.random();
     if (this.config.style === 'aggressive') {
-      if (distance < 3.55 && roll < 0.42) this.startAttack(ai, distance > 2.6 ? 'fleche' : distance > 1.8 ? 'lunge' : 'attack');
-      else this.aiMove(distance > 2.25 ? 1 : -1, params.speed);
+      if (distance < p.safeThreshold && roll < 0.42) this.startAttack(ai, distance > p.threatThreshold ? 'fleche' : distance > p.lungeThreshold ? 'lunge' : 'attack');
+      else this.aiMove(distance > p.lungeThreshold ? 1 : -1, params.speed);
     } else if (this.config.style === 'deceiver') {
-      if (distance < 2.75 && roll < 0.48) this.startFeint(ai);
-      else if (distance < 2.25 && roll < 0.68) this.startAttack(ai, 'lunge');
-      else this.aiMove(distance > 2.2 ? 1 : distance < 1.45 ? -1 : 0, params.speed);
+      if (distance < p.threatThreshold && roll < 0.48) this.startFeint(ai);
+      else if (distance < p.lungeThreshold && roll < 0.68) this.startAttack(ai, 'lunge');
+      else this.aiMove(distance > p.lungeThreshold ? 1 : distance < p.innerThreshold ? -1 : 0, params.speed);
     } else {
-      if (distance < 1.9 && roll < 0.26) this.startAttack(ai, 'attack');
-      else if (distance < 2.55 && roll < 0.38) this.startFeint(ai);
-      else this.aiMove(distance > 2.45 ? 1 : distance < 1.5 ? -1 : roll < 0.2 ? -1 : 0, params.speed);
+      if (distance < p.innerThreshold && roll < 0.26) this.startAttack(ai, 'attack');
+      else if (distance < p.threatThreshold && roll < 0.38) this.startFeint(ai);
+      else this.aiMove(distance > p.threatThreshold ? 1 : distance < p.innerThreshold ? -1 : roll < 0.2 ? -1 : 0, params.speed);
     }
   }
 
@@ -537,17 +556,28 @@ export class FencingGame {
 
   private updateAction(fencer: Fencer, dt: number) {
     const action = fencer.action;
+    const p = this.combatConfig.params;
     action.elapsed += dt;
     const t = action.elapsed;
-    if (action.type === 'halfstep') this.move(fencer, fencer.moveDirection, dt * 0.82);
-    if (action.type === 'ballestra' && t < 0.3) this.move(fencer, 1, dt * 2.25);
-    if (action.type === 'lunge' && t > 0.07 && t < 0.43) this.move(fencer, 1, dt * 2.75 * Math.sin(((t - 0.07) / 0.36) * Math.PI));
-    if (action.type === 'fleche' && t > 0.08 && t < 0.59) this.move(fencer, 1, dt * 4.15 * Math.sin(((t - 0.08) / 0.51) * Math.PI));
+    if (action.type === 'halfstep') this.move(fencer, fencer.moveDirection, dt * p.halfstepSpeed);
+    if (action.type === 'ballestra' && t < 0.3) this.move(fencer, 1, dt * p.ballestraSpeed);
+    if (action.type === 'lunge' && t > 0.07 && t < p.lungeAdvanceEnd) {
+      const seg = (t - 0.07) / (p.lungeAdvanceEnd - 0.07);
+      this.move(fencer, 1, dt * p.lungeForwardSpeed * Math.sin(clamp(seg, 0, 1) * Math.PI));
+    }
+    if (action.type === 'fleche' && t > 0.08 && t < p.flecheAdvanceEnd) {
+      const seg = (t - 0.08) / (p.flecheAdvanceEnd - 0.08);
+      this.move(fencer, 1, dt * p.flecheForwardSpeed * Math.sin(clamp(seg, 0, 1) * Math.PI));
+    }
 
     if (this.isAttacking(fencer)) {
       if (t < action.hitAt) fencer.extension = 0.12 + 0.88 * easeOut(t / action.hitAt);
-      else if (t < action.hitAt + 0.19) fencer.extension = 1;
-      else fencer.extension = 1 - 0.88 * easeInOut((t - action.hitAt - 0.19) / Math.max(0.1, action.duration - action.hitAt - 0.19));
+      else if (t < action.hitAt + p.lungeHoldTime) fencer.extension = 1;
+      else {
+        const recoverStart = action.hitAt + p.lungeHoldTime;
+        const recoverDur = Math.max(0.05, action.duration - recoverStart);
+        fencer.extension = 1 - 0.88 * easeInOut((t - recoverStart) / recoverDur);
+      }
       if (t > action.hitAt * 0.45 && !action.disengaged && Math.abs(fencer.aim.x - (action.startAimX ?? 0)) > 0.38) {
         action.disengaged = true;
         action.attackLine = this.parryFromAim(fencer.aim.x, fencer.aim.y);
@@ -624,12 +654,14 @@ export class FencingGame {
 
   private checkCombat(attacker: Fencer, defender: Fencer) {
     const action = attacker.action;
-    if (!this.isAttacking(attacker) || action.hasHit || action.elapsed < action.hitAt || action.elapsed > action.hitAt + 0.22) return;
+    const p = this.combatConfig.params;
+    if (!this.isAttacking(attacker) || action.hasHit || action.elapsed < action.hitAt || action.elapsed > action.hitAt + p.lungeHoldTime + 0.04) return;
     if (defender.action.type === 'parry') {
-      const p = defender.action;
-      const active = p.elapsed > 0.055 && p.elapsed < 0.245;
-      const correct = p.parry === action.attackLine;
-      const bladesNear = this.segmentDistance(attacker.bladeBase, attacker.bladeTip, defender.bladeBase, defender.bladeTip) < 0.72;
+      const dp = this.combatConfig.params;
+      const pa = defender.action;
+      const active = pa.elapsed > dp.parryActiveStart && pa.elapsed < dp.parryActiveEnd;
+      const correct = pa.parry === action.attackLine;
+      const bladesNear = this.segmentDistance(attacker.bladeBase, attacker.bladeTip, defender.bladeBase, defender.bladeTip) < dp.parryBladeMaxDistance;
       if (active && correct && bladesNear) {
         action.hasHit = true;
         action.elapsed = Math.max(action.elapsed, action.hitAt + 0.2);
@@ -639,7 +671,7 @@ export class FencingGame {
         this.audio.blade();
         this.clashLight.position.copy(attacker.bladeTip).lerp(defender.bladeTip, 0.5);
         this.clashLight.intensity = 7;
-        this.emit('parry', defender.side, `Parry ${p.parry} · ${defender.side === 'player' ? '格挡成功' : '对手格挡'}`, this.config.weapon === 'epee' ? 'Riposte 窗口已开启' : '优先权转移 · 现在反击');
+        this.emit('parry', defender.side, `Parry ${pa.parry} · ${defender.side === 'player' ? '格挡成功' : '对手格挡'}`, this.config.weapon === 'epee' ? 'Riposte 窗口已开启' : '优先权转移 · 现在反击');
         return;
       }
     }
@@ -781,7 +813,7 @@ export class FencingGame {
 
   private publish() {
     const distance = this.bodyDistance();
-    const zone = distance > 3.2 ? '安全距离' : distance > 2.25 ? '威胁距离' : distance > 1.3 ? '弓步距离' : '内围距离';
+    const zone = this.combatConfig.zoneOf(distance);
     let playerAction = ACTION_NAMES[this.player.action.type] ?? this.player.action.type;
     if (this.player.action.isRiposte) playerAction = 'Riposte · 防守反击';
     if (this.player.action.disengaged) playerAction = 'Disengagement · 转移进攻';
@@ -790,6 +822,7 @@ export class FencingGame {
       priority: this.config.weapon === 'epee' ? null : this.priority, view: this.view,
       playerAction, aiAction: ACTION_NAMES[this.ai.action.type] ?? this.ai.action.type,
       parry: this.player.parry, stats: { ...this.player.stats }, overtime: this.overtime,
+      preset: this.combatConfig.preset,
     });
   }
 
