@@ -664,6 +664,9 @@ export class FencerVisual {
     ];
     const jacket = new THREE.Mesh(new THREE.LatheGeometry(jacketPoints, 24), white);
     jacket.scale.z = 0.7;
+    // 衣服底部对齐腰部（pelvis 世界 y≈0.90，torso.position.y≈0.02）
+    // LatheGeometry 自身 y ∈ [0, 0.57]，mesh.position.y = 0.88 让 jacket 底部世界 y ≈ 0.90
+    jacket.position.y = 0.88;
     jacket.castShadow = true;
     jacket.receiveShadow = true;
     this.torso.add(jacket);
@@ -673,16 +676,17 @@ export class FencerVisual {
     this.pelvis.castShadow = true;
     this.motion.add(this.pelvis);
 
-    this.addBox(0.016, 0.45, 0.012, 0.045, 0.29, -0.162, dark, this.torso);
-    this.addBox(0.095, 0.022, 0.025, 0.21, 0.475, -0.11, accent, this.torso).rotation.z = -0.3;
-    this.addBox(0.095, 0.022, 0.025, -0.21, 0.475, -0.11, accent, this.torso).rotation.z = 0.3;
+    // 所有在 torso.local 下的衣物零件统一 +0.88 抬高（对齐 jacket 底边）
+    this.addBox(0.016, 0.45, 0.012, 0.045, 1.17, -0.162, dark, this.torso);
+    this.addBox(0.095, 0.022, 0.025, 0.21, 1.355, -0.11, accent, this.torso).rotation.z = -0.3;
+    this.addBox(0.095, 0.022, 0.025, -0.21, 1.355, -0.11, accent, this.torso).rotation.z = 0.3;
     const collar = new THREE.Mesh(new THREE.TorusGeometry(0.098, 0.015, 7, 24), dark);
     collar.rotation.x = Math.PI / 2;
-    collar.position.y = 0.568;
+    collar.position.y = 1.448;
     this.torso.add(collar);
     for (let i = 0; i < 4; i += 1) {
       const snap = new THREE.Mesh(new THREE.SphereGeometry(0.008, 8, 6), steel);
-      snap.position.set(0.058, 0.15 + i * 0.095, -0.174);
+      snap.position.set(0.058, 1.03 + i * 0.095, -0.174);
       this.torso.add(snap);
     }
 
@@ -697,7 +701,7 @@ export class FencerVisual {
     this.rightFoot = this.createShoe(leather, sole, accent);
     this.leftFoot = this.createShoe(leather, sole, accent);
 
-    this.head.position.set(0, 0.74, -0.005);
+    this.head.position.set(0, 1.68, -0.005);
     const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.073, 0.088, 0.12, 16), dark);
     neck.position.y = -0.19;
     neck.castShadow = true;
@@ -883,8 +887,9 @@ export class FencerVisual {
 
     // --- 6) 手臂：IK 解肘，以 pose buffer 的 hand 目标为驱动 ---
     this.torso.updateMatrix();
-    const rightShoulderWorld = new THREE.Vector3(0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
-    const leftShoulderWorld = new THREE.Vector3(-0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
+    // 肩点（torso.local 下），对应解剖意义上的上臂旋转中心
+    const rightShoulderWorld = new THREE.Vector3(0.225, 1.60, 0).applyMatrix4(this.torso.matrix);
+    const leftShoulderWorld = new THREE.Vector3(-0.225, 1.60, 0).applyMatrix4(this.torso.matrix);
 
     // swordHand 在 pose buffer 中是 "相对于 torso 中心" 的局部量；
     // 叠加 aimX → 剑尖侧摆（视觉上手随瞄准）、disengage → 绕开偏移、bladeDirection → 保持与武器方向一致
