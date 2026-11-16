@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { samplePose, enGardePose } from './poseBuffer';
 import type { FencerSnapshot, Side, Weapon, ViewMode } from './types';
 
 type ScoreLightColor = 'green' | 'red' | 'white' | 'off';
@@ -822,149 +823,119 @@ export class FencerVisual {
     return direction;
   }
 
+  /** 单一权威写入点：pose buffer 驱动身体，IK 解肘、engine bladeTip 驱动武器。
+   *  所有骨骼只在本方法的帧末被写一次，避免多源覆盖竞争。
+   */
   update(snapshot: FencerSnapshot, dt: number, viewMode: ViewMode): void {
     const stepDt = Math.min(0.05, Math.max(0, dt));
     this.time += stepDt;
+
+    // --- 1) 从 pose buffer 取权威姿态 progress ∈ [0,1]，parry 编号参与动态模板 ---
     const action = snapshot.action;
     const progress = actionProgress(action);
-    const peak = actionPeak(action);
-    const envelope = attackEnvelope(progress, peak);
-    const pulse = Math.sin(progress * Math.PI);
+    const weapon = this.weapon;
+    const bufferPose = samplePose(action.type, progress, snapshot.parry, weapon);
+    // idle 时在 pose buffer 已有呼吸变化基础上再叠一层呼吸
+    const breathingY = action.type === 'idle' ? Math.sin(this.time * 1.65 + (this.side === 'ai' ? 1.3 : 0)) * 0.005 : 0;
 
-    this.extension = damp(this.extension, clamp01(snapshot.extension), 15, stepDt);
-    this.aimX = damp(this.aimX, THREE.MathUtils.clamp(snapshot.aim.x, -1, 1), 11, stepDt);
-    this.aimY = damp(this.aimY, THREE.MathUtils.clamp(snapshot.aim.y, -1, 1), 11, stepDt);
-    this.lunge = damp(this.lunge, action.type === 'lunge' ? envelope : 0, 18, stepDt);
-    this.fleche = damp(this.fleche, action.type === 'fleche' ? envelope : 0, 15, stepDt);
-    this.attack = damp(
-      this.attack,
-      action.type === 'attack' || action.type === 'lunge' || action.type === 'fleche' ? envelope : 0,
-      18,
-      stepDt,
-    );
-    this.feint = damp(this.feint, action.type === 'feint' ? pulse : 0, 16, stepDt);
-    this.parryAmount = damp(this.parryAmount, action.type === 'parry' ? envelope : 0, 20, stepDt);
-    this.prise = damp(this.prise, action.type === 'prise' ? pulse : 0, 17, stepDt);
-    this.hit = damp(this.hit, action.type === 'hit' ? pulse : 0, 20, stepDt);
-
+    // --- 2) root 层：整体位置 + 朝向 ---
     const targetPosition = new THREE.Vector3(snapshot.position.x, snapshot.position.y, snapshot.position.z);
     this.root.position.lerp(targetPosition, 1 - Math.exp(-18 * stepDt));
     this.root.rotation.y = this.side === 'player' ? 0 : Math.PI;
 
-    const jump = action.type === 'ballestra'
-      ? Math.sin(progress * Math.PI) * 0.14
-      : action.type === 'fleche'
-        ? Math.max(0, Math.sin(progress * Math.PI * 2)) * 0.045
-        : 0;
-    this.motion.position.y = jump;
+    // motionLift 来自 pose buffer（ballestra / fleche 的跳跃）
+    this.motion.position.y = bufferPose.motionLift;
 
-    const speedBob = Math.min(Math.abs(snapshot.speed), 3) * Math.sin(this.time * 10) * 0.004;
-    const breathing = Math.sin(this.time * 1.65 + (this.side === 'ai' ? 1.3 : 0)) * 0.006;
-    const hipY = 0.88 - this.lunge * 0.105 - this.fleche * 0.055 + this.hit * 0.025;
-    const hipZ = 0.055 - this.lunge * 0.065 - this.attack * 0.025 + this.hit * 0.07;
-    this.pelvis.position.set(0, hipY - 0.025, hipZ);
-    this.torso.position.set(0, hipY + 0.02 + breathing + speedBob, hipZ);
+    // --- 3) pelvis + torso（pose buffer 基础 + 呼吸增量）---
+    const pelvisY = bufferPose.pelvisPos[1] + breathingY;
+    const pelvisZ = bufferPose.pelvisPos[2];
+    this.pelvis.position.set(bufferPose.pelvisPos[0], pelvisY, pelvisZ);
 
-    const parryValue = action.parry ?? snapshot.parry;
-    const parryDirection = parryValue % 2 === 0 ? -1 : 1;
-    const disengage = action.disengaged ? Math.sin(progress * Math.PI * 2) * Math.max(pulse, this.feint) : 0;
-    this.torso.rotation.set(
-      -0.075 - this.lunge * 0.23 - this.fleche * 0.29 - this.attack * 0.055 - this.prise * 0.06 + this.hit * 0.21 + this.aimY * 0.035,
-      -this.aimX * 0.11 + parryDirection * this.parryAmount * 0.095 + disengage * 0.05,
-      Math.sin(this.time * 1.2) * 0.008 + parryDirection * this.parryAmount * 0.035 - this.hit * 0.085,
+    // torso 叠加 aim 微调：瞄准方向 → 躯干侧扭（小量，保持专业感）
+    const aimX = THREE.MathUtils.clamp(snapshot.aim.x, -1, 1);
+    const aimY = THREE.MathUtils.clamp(snapshot.aim.y, -1, 1);
+    const disengaged = action.disengaged ? Math.sin(progress * Math.PI * 2) * 0.04 : 0;
+    this.torso.position.set(
+      bufferPose.torsoPos[0],
+      bufferPose.torsoPos[1] + breathingY,
+      bufferPose.torsoPos[2],
     );
-    this.head.position.set(0, 0.74, -0.005 + this.hit * 0.035);
+    this.torso.rotation.set(
+      bufferPose.torsoRot[0] + aimY * 0.04,          // aimY → torso 俯仰
+      bufferPose.torsoRot[1] - aimX * 0.06 - disengaged, // aimX → torso 侧扭
+      bufferPose.torsoRot[2],
+    );
+
+    // --- 4) head（pose buffer 基础 + aim 头瞄，不跟随 torso 扭动）---
+    this.head.position.set(bufferPose.headPos[0], bufferPose.headPos[1] + breathingY * 0.3, bufferPose.headPos[2]);
     this.head.rotation.set(
-      this.aimY * 0.12 + this.hit * 0.16 + this.fleche * 0.08,
-      -this.aimX * 0.19 + this.feint * Math.sin(progress * Math.PI * 2) * 0.075,
-      -this.hit * 0.11 + disengage * 0.04,
+      bufferPose.headRot[0] + aimY * 0.12,
+      bufferPose.headRot[1] - aimX * 0.18,
+      bufferPose.headRot[2],
     );
     this.head.visible = viewMode === 'third' || this.side === 'ai';
 
+    // --- 5) 武器：继续由 engine bladeTip / bladeBase 驱动，与 pose buffer 解耦 ---
     const base = new THREE.Vector3(snapshot.bladeBase.x, snapshot.bladeBase.y, snapshot.bladeBase.z);
     const tip = new THREE.Vector3(snapshot.bladeTip.x, snapshot.bladeTip.y, snapshot.bladeTip.z);
     const bladeDirection = this.updateWeapon(base, tip);
     this.root.updateMatrixWorld(true);
 
+    // --- 6) 手臂：IK 解肘，以 pose buffer 的 hand 目标为驱动 ---
     this.torso.updateMatrix();
-    const rightShoulder = new THREE.Vector3(0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
-    const leftShoulder = new THREE.Vector3(-0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
-    const swordHandWorld = base.clone().addScaledVector(bladeDirection, -0.088);
-    const swordHand = this.motion.worldToLocal(swordHandWorld);
-    const rightElbow = solveElbow(rightShoulder, swordHand, 0.3, 0.275, new THREE.Vector3(0.85, -0.5, 0.24));
-    this.updateLimb(this.rightArm, rightShoulder, rightElbow, swordHand);
-    this.rightHand.position.copy(swordHand);
+    const rightShoulderWorld = new THREE.Vector3(0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
+    const leftShoulderWorld = new THREE.Vector3(-0.225, 0.455, 0).applyMatrix4(this.torso.matrix);
 
-    const offHand = new THREE.Vector3(
-      -0.31 - this.hit * 0.1,
-      1.44 - this.lunge * 0.29 - this.fleche * 0.22 + this.hit * 0.06,
-      0.34 + this.lunge * 0.23 + this.fleche * 0.25 - this.hit * 0.16,
+    // swordHand 在 pose buffer 中是 "相对于 torso 中心" 的局部量；
+    // 叠加 aimX → 剑尖侧摆（视觉上手随瞄准）、disengage → 绕开偏移、bladeDirection → 保持与武器方向一致
+    const swordHandTorsoLocal = new THREE.Vector3(
+      bufferPose.swordHandTorsoLocal[0] + aimX * 0.025 + disengaged * 0.03,
+      bufferPose.swordHandTorsoLocal[1] + aimY * 0.015,
+      bufferPose.swordHandTorsoLocal[2],
     );
-    offHand.x += this.aimX * 0.025 + disengage * 0.03;
-    const leftElbow = solveElbow(leftShoulder, offHand, 0.29, 0.265, new THREE.Vector3(-0.85, -0.2, 0.5));
-    this.updateLimb(this.leftArm, leftShoulder, leftElbow, offHand);
-    this.leftHand.position.copy(offHand);
+    // 把 swordHandTorsoLocal 转到 world，再转回 motion.local（solveElbow 期望 world 输入）
+    const swordHandWorld = swordHandTorsoLocal.clone().applyMatrix4(this.torso.matrix);
+    const swordHandLocal = this.motion.worldToLocal(swordHandWorld);
+    const rightElbow = solveElbow(rightShoulderWorld, swordHandWorld, 0.3, 0.275, new THREE.Vector3(0.85, -0.5, 0.24));
+    this.updateLimb(this.rightArm, rightShoulderWorld, rightElbow, swordHandWorld);
+    this.rightHand.position.copy(swordHandLocal);
 
-    let frontLift = 0;
-    let rearLift = 0;
-    let frontTravel = 0;
-    let rearTravel = 0;
-    const step = Math.sin(progress * Math.PI);
-    if (action.type === 'advance' || action.type === 'halfstep' || action.type === 'glissade') {
-      const amount = action.type === 'halfstep' ? 0.08 : action.type === 'glissade' ? 0.19 : 0.15;
-      frontTravel = -amount * step;
-      rearTravel = -amount * 0.65 * Math.sin(smooth01(progress) * Math.PI);
-      frontLift = Math.sin(Math.min(1, progress * 2) * Math.PI) * 0.065;
-      rearLift = progress > 0.45 ? Math.sin((progress - 0.45) / 0.55 * Math.PI) * 0.055 : 0;
-    } else if (action.type === 'retreat') {
-      frontTravel = 0.09 * Math.sin(smooth01(progress) * Math.PI);
-      rearTravel = 0.16 * step;
-      rearLift = Math.sin(Math.min(1, progress * 2) * Math.PI) * 0.065;
-      frontLift = progress > 0.45 ? Math.sin((progress - 0.45) / 0.55 * Math.PI) * 0.05 : 0;
-    } else if (action.type === 'lunge') {
-      frontLift = Math.sin(progress * Math.PI) * 0.035;
-    } else if (action.type === 'fleche') {
-      const run = Math.sin(progress * Math.PI * 4);
-      frontLift = Math.max(0, run) * 0.1;
-      rearLift = Math.max(0, -run) * 0.1;
-      frontTravel = run * 0.12;
-      rearTravel = run * 0.1;
-    } else if (action.type === 'ballestra') {
-      frontTravel = -0.11 * step;
-      rearTravel = -0.08 * step;
-      frontLift = 0.025 * step;
-      rearLift = 0.025 * step;
-    }
+    const offHandTorsoLocal = new THREE.Vector3(
+      bufferPose.offHandTorsoLocal[0],
+      bufferPose.offHandTorsoLocal[1],
+      bufferPose.offHandTorsoLocal[2],
+    );
+    const offHandWorld = offHandTorsoLocal.clone().applyMatrix4(this.torso.matrix);
+    const offHandLocal = this.motion.worldToLocal(offHandWorld);
+    const leftElbow = solveElbow(leftShoulderWorld, offHandWorld, 0.29, 0.265, new THREE.Vector3(-0.85, -0.2, 0.5));
+    this.updateLimb(this.leftArm, leftShoulderWorld, leftElbow, offHandWorld);
+    this.leftHand.position.copy(offHandLocal);
 
-    const rightHip = new THREE.Vector3(0.115, hipY, hipZ);
-    const leftHip = new THREE.Vector3(-0.115, hipY, hipZ);
-    const rightAnkle = new THREE.Vector3(
-      0.15,
-      0.105 + frontLift,
-      -0.25 + frontTravel - this.lunge * 0.52 - this.fleche * 0.16 - this.extension * 0.055 + this.hit * 0.08,
+    // --- 7) 腿：pose buffer 给出的 world-local 坐标直接作为目标 ---
+    const rightAnkleRoot = new THREE.Vector3(...bufferPose.rightAnkleRootLocal);
+    const rightKneeRoot = new THREE.Vector3(...bufferPose.rightKneeRootLocal);
+    const leftAnkleRoot = new THREE.Vector3(...bufferPose.leftAnkleRootLocal);
+    const leftKneeRoot = new THREE.Vector3(...bufferPose.leftKneeRootLocal);
+    // 髋部关节 = pelvis 位置 + hipPelvisLocal
+    const rightHipWorld = new THREE.Vector3(
+      bufferPose.pelvisPos[0] + bufferPose.rightHipPelvisLocal[0],
+      bufferPose.pelvisPos[1] + bufferPose.rightHipPelvisLocal[1] + breathingY,
+      bufferPose.pelvisPos[2] + bufferPose.rightHipPelvisLocal[2],
     );
-    const leftAnkle = new THREE.Vector3(
-      -0.17,
-      0.105 + rearLift,
-      0.33 + rearTravel + this.lunge * 0.29 + this.fleche * 0.12 + this.hit * 0.09,
+    const leftHipWorld = new THREE.Vector3(
+      bufferPose.pelvisPos[0] + bufferPose.leftHipPelvisLocal[0],
+      bufferPose.pelvisPos[1] + bufferPose.leftHipPelvisLocal[1] + breathingY,
+      bufferPose.pelvisPos[2] + bufferPose.leftHipPelvisLocal[2],
     );
-    const rightKnee = new THREE.Vector3(
-      0.155,
-      (hipY + rightAnkle.y) * 0.5 + 0.035 - this.lunge * 0.035,
-      rightAnkle.z - 0.065 + this.lunge * 0.035,
-    );
-    const leftKnee = new THREE.Vector3(
-      -0.165,
-      (hipY + leftAnkle.y) * 0.5 + 0.025 + this.lunge * 0.035,
-      (hipZ + leftAnkle.z) * 0.5 - this.lunge * 0.025,
-    );
-    this.updateLimb(this.rightLeg, rightHip, rightKnee, rightAnkle);
-    this.updateLimb(this.leftLeg, leftHip, leftKnee, leftAnkle);
+    // 统一用 root world（root 没有额外 translate 除了 motion.position.y 的跳跃已在上面加了）
+    this.updateLimb(this.rightLeg, rightHipWorld, rightKneeRoot, rightAnkleRoot);
+    this.updateLimb(this.leftLeg, leftHipWorld, leftKneeRoot, leftAnkleRoot);
 
-    this.rightFoot.position.set(rightAnkle.x, frontLift, rightAnkle.z);
-    this.leftFoot.position.set(leftAnkle.x, rearLift, leftAnkle.z);
-    this.rightFoot.rotation.y = 0.035 - this.fleche * 0.08;
-    this.leftFoot.rotation.y = -0.88 + this.lunge * 0.18 + this.fleche * 0.55;
+    // --- 8) 脚：yaw 来自 pose buffer，位置与 ankle 对齐 ---
+    this.rightFoot.position.copy(rightAnkleRoot);
+    this.leftFoot.position.copy(leftAnkleRoot);
+    this.rightFoot.rotation.y = bufferPose.rightFootYaw;
+    this.leftFoot.rotation.y = bufferPose.leftFootYaw;
   }
 
   dispose(): void {
