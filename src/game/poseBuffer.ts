@@ -78,21 +78,46 @@ function assemble(o: PoseKeyframe): PoseSample {
   const ra = o.rightAnkleKneeLocal; const la = o.leftAnkleKneeLocal;
   const add = (a: number[], b: number[]): [number, number, number] =>
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+
+  // —— 腿链 y 归一化：不管关键帧里 hip/knee/ankle 的 y 怎么写，
+  // 把三截腿 y 的总和强制拉到 -pelvisPos.y，让 ankleRootLocal.y 始终 = 地面 0。
+  // 关键帧的"弯曲姿态"由各段 y 的相对比例决定，归一化只做整体平移。
+  const normalizeLeg = (hip: number[], knee: number[], ankle: number[]) => {
+    const curSum = hip[1] + knee[1] + ankle[1];
+    const targetSum = -p[1];
+    const shift = targetSum - curSum;
+    // 按各段绝对值加权分摊 shift，膝/踝的弯曲姿态保持更稳
+    const totalAbs = Math.abs(hip[1]) + Math.abs(knee[1]) + Math.abs(ankle[1]) || 1;
+    const wHip = Math.abs(hip[1]) / totalAbs;
+    const wKnee = Math.abs(knee[1]) / totalAbs;
+    const wAnkle = Math.abs(ankle[1]) / totalAbs;
+    const y2 = hip[1] + shift * wHip;
+    const y3 = knee[1] + shift * wKnee;
+    const y4 = ankle[1] + shift * wAnkle;
+    return {
+      hip: [hip[0], y2, hip[2]] as [number, number, number],
+      knee: [knee[0], y3, knee[2]] as [number, number, number],
+      ankle: [ankle[0], y4, ankle[2]] as [number, number, number],
+    };
+  };
+  const nR = normalizeLeg(rh, rk, ra);
+  const nL = normalizeLeg(lh, lk, la);
+
   return {
     torsoPos: o.torsoPos, torsoRot: o.torsoRot, pelvisPos: o.pelvisPos,
     headRot: o.headRot, headPos: o.headPos,
     swordHandTorsoLocal: o.swordHandTorsoLocal, offHandTorsoLocal: o.offHandTorsoLocal,
     bladeExtension: o.bladeExtension,
-    rightHipPelvisLocal: o.rightHipPelvisLocal,
-    rightKneeHipLocal: o.rightKneeHipLocal,
-    rightAnkleKneeLocal: o.rightAnkleKneeLocal,
-    leftHipPelvisLocal: o.leftHipPelvisLocal,
-    leftKneeHipLocal: o.leftKneeHipLocal,
-    leftAnkleKneeLocal: o.leftAnkleKneeLocal,
-    rightAnkleRootLocal: add(add(p, rh), add(rk, ra)),
-    rightKneeRootLocal: add(add(p, rh), rk),
-    leftAnkleRootLocal: add(add(p, lh), add(lk, la)),
-    leftKneeRootLocal: add(add(p, lh), lk),
+    rightHipPelvisLocal: nR.hip,
+    rightKneeHipLocal: nR.knee,
+    rightAnkleKneeLocal: nR.ankle,
+    leftHipPelvisLocal: nL.hip,
+    leftKneeHipLocal: nL.knee,
+    leftAnkleKneeLocal: nL.ankle,
+    rightAnkleRootLocal: add(add(p, nR.hip), add(nR.knee, nR.ankle)),
+    rightKneeRootLocal: add(add(p, nR.hip), nR.knee),
+    leftAnkleRootLocal: add(add(p, nL.hip), add(nL.knee, nL.ankle)),
+    leftKneeRootLocal: add(add(p, nL.hip), nL.knee),
     rightFootYaw: o.rightFootYaw, leftFootYaw: o.leftFootYaw,
     motionLift: o.motionLift, weightShift: o.weightShift,
   };
@@ -142,22 +167,31 @@ function kf(t: number, base: Omit<PoseKeyframe, 't'>): PoseKeyframe {
 // 剑抬至下巴高度，剑尖约眼高；Off-hand 在身体侧后方、肘 90° 预备
 // ============================================================
 
+/** 人体坐标约定（motion.local 下，y=0 为地面）：
+ *   pelvis 中心 ≈ 0.90m，胸廓(torso 中心) ≈ 1.30m，头中心 ≈ 1.68m。
+ *   headPos 是 torso.local 相对量（head 是 torso 的子级），
+ *   swordHandTorsoLocal / offHandTorsoLocal 也是 torso.local 相对量。
+ *   腿链各段 hipPelvisLocal + kneeHipLocal + ankleKneeLocal 的 y 分量
+ *   必须等于 -pelvisPos.y，保证 ankleRootLocal.y = 地面 0。
+ */
 const EN_GARDE: Omit<PoseKeyframe, 't'> = {
-  torsoPos: [0, 0.02, 0.01],
+  torsoPos: [0, 1.30, 0.01],
   torsoRot: [-0.04, 0.00, 0.00],
   pelvisPos: [0, 0.90, 0.00],
   headRot: [0.00, 0.00, 0.00],
-  headPos: [0, 0.74, 0.00],
+  headPos: [0, 0.40, 0.00],
   swordHandTorsoLocal: [0.09, 0.50, -0.80],
   offHandTorsoLocal: [-0.12, 0.25, 0.45],
   bladeExtension: 0.72,
+  // 右腿：髋→膝→踝 y 分段，三截总和 = -0.90，保证 ankle 在地面
   rightHipPelvisLocal: [0.115, -0.02, -0.03],
-  rightKneeHipLocal: [0.12, -0.38, -0.12],
-  rightAnkleKneeLocal: [0.00, -0.34, -0.50],
+  rightKneeHipLocal: [0.12, -0.42, -0.12],
+  rightAnkleKneeLocal: [0.00, -0.46, -0.50],
   rightFootYaw: 0.00,
+  // 左腿：髋→膝→踝 y 分段，三截总和 = -0.90
   leftHipPelvisLocal: [-0.115, -0.02, 0.03],
-  leftKneeHipLocal: [-0.13, -0.36, 0.10],
-  leftAnkleKneeLocal: [-0.02, -0.34, 0.55],
+  leftKneeHipLocal: [-0.13, -0.40, 0.10],
+  leftAnkleKneeLocal: [-0.02, -0.48, 0.55],
   leftFootYaw: 0.55,
   motionLift: 0,
   weightShift: -0.2,
@@ -165,7 +199,7 @@ const EN_GARDE: Omit<PoseKeyframe, 't'> = {
 
 const BREATHE: Omit<PoseKeyframe, 't'> = {
   ...EN_GARDE,
-  torsoPos: [0, 0.025, 0.01],
+  torsoPos: [0, 1.305, 0.01],
   pelvisPos: [0, 0.905, 0.00],
   bladeExtension: 0.70,
 };
@@ -175,7 +209,7 @@ const ADVANCE_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...EN_GARDE, weightShift: -0.2, bladeExtension: 0.70 }),
   kf(0.30, {
     ...EN_GARDE,
-    torsoPos: [0, 0.02, 0.00],
+    torsoPos: [0, 1.3, 0.00],
     torsoRot: [-0.02, 0, 0],
     pelvisPos: [0, 0.90, -0.12],
     swordHandTorsoLocal: [0.09, 0.50, -0.82],
@@ -189,7 +223,7 @@ const ADVANCE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.55, {
     ...EN_GARDE,
-    torsoPos: [0, 0.018, -0.12],
+    torsoPos: [0, 1.298, -0.12],
     torsoRot: [-0.06, 0, 0],
     pelvisPos: [0, 0.89, -0.22],
     swordHandTorsoLocal: [0.09, 0.49, -0.86],
@@ -210,7 +244,7 @@ const RETREAT_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...EN_GARDE, weightShift: -0.2 }),
   kf(0.30, {
     ...EN_GARDE,
-    torsoPos: [0, 0.022, 0.10],
+    torsoPos: [0, 1.302, 0.10],
     torsoRot: [0.03, 0, 0],
     pelvisPos: [0, 0.905, 0.14],
     swordHandTorsoLocal: [0.085, 0.505, -0.77],
@@ -224,7 +258,7 @@ const RETREAT_KEYS: PoseKeyframe[] = [
   }),
   kf(0.60, {
     ...EN_GARDE,
-    torsoPos: [0, 0.022, 0.14],
+    torsoPos: [0, 1.302, 0.14],
     torsoRot: [0.02, 0, 0],
     pelvisPos: [0, 0.90, 0.20],
     swordHandTorsoLocal: [0.09, 0.50, -0.79],
@@ -242,7 +276,7 @@ const RETREAT_KEYS: PoseKeyframe[] = [
 const LUNGE_KEYS: PoseKeyframe[] = [
   kf(0.00, {
     ...EN_GARDE,
-    torsoPos: [0, 0.02, 0.04],
+    torsoPos: [0, 1.3, 0.04],
     torsoRot: [0.02, 0, 0],
     pelvisPos: [0, 0.91, 0.08],
     swordHandTorsoLocal: [0.09, 0.49, -0.78],
@@ -255,7 +289,7 @@ const LUNGE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.15, {
     ...EN_GARDE,
-    torsoPos: [0, 0.02, -0.02],
+    torsoPos: [0, 1.3, -0.02],
     torsoRot: [-0.06, 0, 0],
     pelvisPos: [0, 0.90, -0.02],
     swordHandTorsoLocal: [0.10, 0.46, -0.92],
@@ -269,10 +303,10 @@ const LUNGE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.35, {
     ...EN_GARDE,
-    torsoPos: [0, 0.005, -0.30],
+    torsoPos: [0, 1.285, -0.30],
     torsoRot: [-0.22, 0, 0],
     pelvisPos: [0, 0.86, -0.38],
-    headRot: [0.05, 0, 0], headPos: [0, 0.75, -0.02],
+    headRot: [0.05, 0, 0], headPos: [0, 0.40, -0.02],
     swordHandTorsoLocal: [0.11, 0.42, -1.20],
     offHandTorsoLocal: [-0.16, 0.10, 0.18],
     bladeExtension: 1.00,
@@ -285,10 +319,10 @@ const LUNGE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.55, {
     ...EN_GARDE,
-    torsoPos: [0, 0.005, -0.38],
+    torsoPos: [0, 1.285, -0.38],
     torsoRot: [-0.26, 0, 0],
     pelvisPos: [0, 0.85, -0.46],
-    headRot: [0.06, 0, 0], headPos: [0, 0.75, -0.03],
+    headRot: [0.06, 0, 0], headPos: [0, 0.40, -0.03],
     swordHandTorsoLocal: [0.11, 0.40, -1.26],
     offHandTorsoLocal: [-0.17, 0.08, 0.14],
     bladeExtension: 1.00,
@@ -301,7 +335,7 @@ const LUNGE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.85, {
     ...EN_GARDE,
-    torsoPos: [0, 0.015, -0.12],
+    torsoPos: [0, 1.295, -0.12],
     torsoRot: [-0.08, 0, 0],
     pelvisPos: [0, 0.89, -0.14],
     swordHandTorsoLocal: [0.09, 0.48, -0.88],
@@ -320,10 +354,10 @@ const FLECHE_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...LUNGE_KEYS[0], weightShift: -0.5 }),
   kf(0.15, {
     ...LUNGE_KEYS[2],
-    torsoPos: [0, -0.03, -0.10],
+    torsoPos: [0, 1.25, -0.10],
     torsoRot: [-0.38, 0, 0],
     pelvisPos: [0, 0.82, -0.18],
-    headRot: [0.08, 0, 0], headPos: [0, 0.76, -0.05],
+    headRot: [0.08, 0, 0], headPos: [0, 0.40, -0.05],
     swordHandTorsoLocal: [0.12, 0.36, -1.16],
     offHandTorsoLocal: [-0.16, 0.04, 0.18],
     bladeExtension: 1.00,
@@ -336,10 +370,10 @@ const FLECHE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.38, {
     ...EN_GARDE,
-    torsoPos: [0, -0.03, -0.34],
+    torsoPos: [0, 1.25, -0.34],
     torsoRot: [-0.40, 0, 0],
     pelvisPos: [0, 0.82, -0.42],
-    headRot: [0.08, 0, 0], headPos: [0, 0.76, -0.05],
+    headRot: [0.08, 0, 0], headPos: [0, 0.40, -0.05],
     swordHandTorsoLocal: [0.12, 0.36, -1.18],
     offHandTorsoLocal: [-0.17, 0.02, 0.16],
     bladeExtension: 1.00,
@@ -352,10 +386,10 @@ const FLECHE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.65, {
     ...EN_GARDE,
-    torsoPos: [0, -0.025, -0.58],
+    torsoPos: [0, 1.255, -0.58],
     torsoRot: [-0.38, 0, 0],
     pelvisPos: [0, 0.83, -0.66],
-    headRot: [0.08, 0, 0], headPos: [0, 0.76, -0.05],
+    headRot: [0.08, 0, 0], headPos: [0, 0.40, -0.05],
     swordHandTorsoLocal: [0.12, 0.36, -1.18],
     offHandTorsoLocal: [-0.17, 0.02, 0.16],
     bladeExtension: 1.00,
@@ -368,7 +402,7 @@ const FLECHE_KEYS: PoseKeyframe[] = [
   }),
   kf(0.88, {
     ...EN_GARDE,
-    torsoPos: [0, 0.01, -0.10],
+    torsoPos: [0, 1.29, -0.10],
     pelvisPos: [0, 0.89, -0.12],
     rightAnkleKneeLocal: [0.00, -0.34, -0.55],
     leftAnkleKneeLocal: [-0.02, -0.34, 0.50],
@@ -383,7 +417,7 @@ const BALLESTRA_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...EN_GARDE, motionLift: 0, weightShift: -0.2 }),
   kf(0.25, {
     ...EN_GARDE,
-    torsoPos: [0, 0.03, -0.08],
+    torsoPos: [0, 1.31, -0.08],
     torsoRot: [-0.04, 0, 0],
     pelvisPos: [0, 0.90, -0.10],
     swordHandTorsoLocal: [0.095, 0.48, -0.88],
@@ -398,7 +432,7 @@ const BALLESTRA_KEYS: PoseKeyframe[] = [
   }),
   kf(0.50, {
     ...EN_GARDE,
-    torsoPos: [0, 0.015, -0.14],
+    torsoPos: [0, 1.295, -0.14],
     pelvisPos: [0, 0.89, -0.16],
     rightAnkleKneeLocal: [0.00, -0.34, -0.72],
     leftAnkleKneeLocal: [-0.02, -0.34, 0.50],
@@ -413,7 +447,7 @@ const ATTACK_STRAIGHT_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...EN_GARDE, bladeExtension: 0.70 }),
   kf(0.35, {
     ...EN_GARDE,
-    torsoPos: [0, 0.018, -0.04],
+    torsoPos: [0, 1.298, -0.04],
     torsoRot: [-0.05, 0, 0],
     pelvisPos: [0, 0.90, -0.02],
     headRot: [0.02, 0, 0],
@@ -438,7 +472,7 @@ const FEINT_KEYS: PoseKeyframe[] = [
   kf(0.00, { ...EN_GARDE, bladeExtension: 0.70 }),
   kf(0.50, {
     ...EN_GARDE,
-    torsoPos: [0, 0.02, -0.02],
+    torsoPos: [0, 1.3, -0.02],
     torsoRot: [-0.03, 0, 0],
     pelvisPos: [0, 0.90, -0.01],
     swordHandTorsoLocal: [0.10, 0.47, -0.96],
@@ -491,7 +525,7 @@ const PRISE_KEYS: PoseKeyframe[] = [
   kf(0.00, EN_GARDE),
   kf(0.50, {
     ...EN_GARDE,
-    torsoPos: [0.015, 0.02, -0.02],
+    torsoPos: [0.015, 1.3, -0.02],
     torsoRot: [-0.02, 0.12, 0],
     pelvisPos: [0, 0.90, -0.01],
     swordHandTorsoLocal: [0.12, 0.50, -0.68],
@@ -507,10 +541,10 @@ const HIT_KEYS: PoseKeyframe[] = [
   kf(0.00, EN_GARDE),
   kf(0.30, {
     ...EN_GARDE,
-    torsoPos: [0, 0.025, 0.06],
+    torsoPos: [0, 1.305, 0.06],
     torsoRot: [0.14, 0, 0],
     pelvisPos: [0, 0.91, 0.08],
-    headRot: [-0.10, 0, 0], headPos: [0, 0.75, 0.02],
+    headRot: [-0.10, 0, 0], headPos: [0, 0.40, 0.02],
     swordHandTorsoLocal: [0.07, 0.52, -0.55],
     offHandTorsoLocal: [-0.10, 0.28, 0.55],
     bladeExtension: 0.35,
