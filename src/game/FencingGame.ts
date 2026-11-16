@@ -1,9 +1,21 @@
-import * as THREE from 'three';
-import { Arena, FencerVisual } from './visuals';
+import { Scene2D, FencerVisual } from './visuals';
+import type { FencerVisual as FencerVisualClass } from './visuals';
 import { FencingAudio } from './audio';
 import { PARRY_NAMES, WEAPON_INFO } from './types';
 import { CombatConfig, type CombatPreset } from './combatConfig';
 import type { ActionState, AIStyle, CombatEvent, Difficulty, FencerSnapshot, GamePhase, MatchConfig, Side, ViewMode, Weapon } from './types';
+
+// --- 小工具，替代 THREE ---
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+const easeOut = (t: number) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeInOut = (t: number) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+type V3 = { x: number; y: number; z: number };
+const v3 = (x = 0, y = 0, z = 0): V3 => ({ x, y, z });
+const v3Sub = (a: V3, b: V3): V3 => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
+const v3AddScaled = (a: V3, b: V3, s: number): V3 => ({ x: a.x + b.x * s, y: a.y + b.y * s, z: a.z + b.z * s });
+const v3Len = (a: V3) => Math.hypot(a.x, a.y, a.z);
+const v3Dist = (a: V3, b: V3) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const v3Norm = (a: V3): V3 => { const l = v3Len(a) || 1; return { x: a.x / l, y: a.y / l, z: a.z / l }; };
 
 export interface GameSnapshot {
   phase: GamePhase;
@@ -23,13 +35,13 @@ export interface GameSnapshot {
 
 interface Fencer {
   side: Side;
-  position: THREE.Vector3;
+  position: V3;
   aim: { x: number; y: number };
   action: ActionState;
-  bladeBase: THREE.Vector3;
-  bladeTip: THREE.Vector3;
-  previousTip: THREE.Vector3;
-  visual: FencerVisual;
+  bladeBase: V3;
+  bladeTip: V3;
+  previousTip: V3;
+  visual: FencerVisualClass;
   parry: number;
   extension: number;
   lastParry: number;
@@ -42,12 +54,9 @@ interface Fencer {
 }
 
 interface PendingHit { side: Side; at: number; target: string }
-interface BodyTarget { center: THREE.Vector3; radius: number; name: string; region: 'torso' | 'head' | 'arm' | 'leg' }
+interface BodyTarget { center: V3; radius: number; name: string; region: 'torso' | 'head' | 'arm' | 'leg' }
 
 const idleAction = (): ActionState => ({ type: 'idle', elapsed: 0, duration: 0, hitAt: 0, hasHit: false });
-const clamp = THREE.MathUtils.clamp;
-const easeOut = (t: number) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
-const easeInOut = (t: number) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 const ACTION_NAMES: Record<string, string> = {
   idle: 'En garde · 预备', advance: 'Advance · 向前步', retreat: 'Retreat · 向后步',
   halfstep: 'Half-step · 半步', glissade: 'Glissade · 滑步', lunge: 'Lunge · 弓步直刺',
@@ -56,18 +65,15 @@ const ACTION_NAMES: Record<string, string> = {
 };
 
 export class FencingGame {
-  readonly renderer: THREE.WebGLRenderer;
-  readonly scene = new THREE.Scene();
-  readonly camera = new THREE.PerspectiveCamera(54, 1, 0.045, 90);
+  readonly scene2d: Scene2D;
   readonly audio = new FencingAudio();
   readonly combatConfig = new CombatConfig('tight');
   config: MatchConfig = { weapon: 'foil', style: 'counter', difficulty: 'advanced', assists: true, targetScore: 15 };
   phase: GamePhase = 'menu';
   view: ViewMode = 'third';
 
-  private arena: Arena;
-  private player: Fencer;
-  private ai: Fencer;
+  private player!: Fencer;
+  private ai!: Fencer;
   private previousPhase: GamePhase = 'allez';
   private phaseElapsed = 0;
   private phaseDuration = 0;
@@ -78,83 +84,58 @@ export class FencingGame {
   private priority: Side | null = null;
   private pendingHits: PendingHit[] = [];
   private keys = new Set<string>();
-  private clock = new THREE.Clock();
   private animationFrame = 0;
   private viewBlend = 0;
   private uiElapsed = 0;
   private accumulator = 0;
   private pointerWasLocked = false;
   private destroyed = false;
-  private trails: Record<Side, THREE.Line>;
-  private trailPoints: Record<Side, THREE.Vector3[]> = { player: [], ai: [] };
-  private clashLight = new THREE.PointLight('#d9f8ff', 0, 3);
-  private resumeAfterPointer = false;
+  private resizeHandler = () => this.scene2d.resize();
+  private lastTime = performance.now();
 
   constructor(
     private container: HTMLElement,
     private onEvent: (event: CombatEvent) => void,
     private onUpdate: (snapshot: GameSnapshot) => void,
   ) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.8));
-    this.renderer.setSize(container.clientWidth, container.clientHeight);
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
-    this.renderer.domElement.id = 'fencing-canvas';
-    this.renderer.domElement.tabIndex = 0;
-    container.appendChild(this.renderer.domElement);
-
-    this.scene.background = new THREE.Color('#080d0f');
-    this.scene.fog = new THREE.FogExp2('#080d0f', 0.037);
-    this.arena = new Arena(this.scene);
-    this.scene.add(this.clashLight);
+    // 创建 Canvas 作为容器的唯一子元素
+    const canvas = document.createElement('canvas');
+    canvas.id = 'fencing-canvas';
+    canvas.style.cssText = 'display:block;width:100%;height:100%;background:#0a1114;';
+    container.innerHTML = '';
+    container.appendChild(canvas);
+    this.scene2d = new Scene2D(canvas);
     this.player = this.createFencer('player');
     this.ai = this.createFencer('ai');
-    this.trails = { player: this.createTrail('#b8f34a'), ai: this.createTrail('#ef5c4d') };
     this.resetPositions();
     this.bindInput();
-    this.resize();
-    window.addEventListener('resize', this.resize);
-    this.clock.start();
+    window.addEventListener('resize', this.resizeHandler);
     this.loop();
   }
 
   private createFencer(side: Side): Fencer {
+    const visual = new FencerVisual(side, this.config.weapon);
     const fencer: Fencer = {
       side,
-      position: new THREE.Vector3(0, 0, side === 'player' ? 2.2 : -2.2),
+      position: v3(0, 0, side === 'player' ? 2.2 : -2.2),
       aim: { x: 0, y: 0 }, action: idleAction(),
-      bladeBase: new THREE.Vector3(), bladeTip: new THREE.Vector3(), previousTip: new THREE.Vector3(),
-      visual: new FencerVisual(this.scene, side, this.config.weapon), parry: 4, extension: 0.12,
+      bladeBase: v3(), bladeTip: v3(), previousTip: v3(),
+      visual, parry: 4, extension: 0.12,
       lastParry: -10, lastAttackEnd: -10, lastAimX: 0, speed: 0, thinkIn: 0.4, moveDirection: 0,
       stats: { hits: 0, parries: 0, attacks: 0 },
     };
+    (visual as unknown as { _z: number })._z = fencer.position.z;
     this.calculateBlade(fencer);
-    fencer.previousTip.copy(fencer.bladeTip);
+    fencer.previousTip = { ...fencer.bladeTip };
     return fencer;
-  }
-
-  private createTrail(color: string) {
-    const geometry = new THREE.BufferGeometry();
-    const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.28, depthWrite: false });
-    const line = new THREE.Line(geometry, material);
-    line.frustumCulled = false;
-    this.scene.add(line);
-    return line;
   }
 
   previewConfig(config: MatchConfig) {
     const weaponChanged = config.weapon !== this.config.weapon;
     this.config = { ...config };
     if (weaponChanged) {
-      this.player.visual.dispose();
-      this.ai.visual.dispose();
-      this.scene.remove(this.player.visual.group, this.ai.visual.group);
-      this.player.visual = new FencerVisual(this.scene, 'player', config.weapon);
-      this.ai.visual = new FencerVisual(this.scene, 'ai', config.weapon);
+      this.player.visual = new FencerVisual(this.player.side, config.weapon);
+      this.ai.visual = new FencerVisual(this.ai.side, config.weapon);
     }
   }
 
@@ -176,8 +157,6 @@ export class FencingGame {
     this.requestPointer();
   }
 
-  restart() { this.startMatch(this.config); }
-
   pause() {
     if (!['allez', 'en garde', 'ready', 'halt'].includes(this.phase)) return;
     this.previousPhase = this.phase;
@@ -190,7 +169,7 @@ export class FencingGame {
   resume() {
     if (this.phase !== 'pause') return;
     this.phase = this.previousPhase;
-    this.clock.getDelta();
+    this.lastTime = performance.now();
     this.requestPointer();
     this.emit('phase', undefined, this.phase === 'allez' ? 'Allez' : '继续', '比赛恢复');
   }
@@ -201,7 +180,7 @@ export class FencingGame {
     this.priority = null;
     this.pendingHits = [];
     this.resetPositions();
-    this.arena.setScoreLights('off', 'off');
+    this.scene2d.setScoreLights('off', 'off');
     if (document.pointerLockElement) document.exitPointerLock();
   }
 
@@ -212,11 +191,10 @@ export class FencingGame {
 
   requestPointer() {
     if (this.phase === 'menu' || this.phase === 'end') return;
-    this.resumeAfterPointer = true;
     try {
-      const request = this.renderer.domElement.requestPointerLock();
-      if (request && typeof request.catch === 'function') request.catch(() => { this.resumeAfterPointer = false; });
-    } catch { this.resumeAfterPointer = false; }
+      const request = this.scene2d.canvas.requestPointerLock();
+      if (request && typeof request.catch === 'function') request.catch(() => {});
+    } catch { /* ignore */ }
   }
 
   private bindInput() {
@@ -243,45 +221,38 @@ export class FencingGame {
     window.addEventListener('keyup', (event) => this.keys.delete(event.code));
     window.addEventListener('blur', () => { if (this.phase === 'allez') this.pause(); });
     document.addEventListener('pointerlockchange', () => {
-      const locked = document.pointerLockElement === this.renderer.domElement;
-      if (locked) { this.pointerWasLocked = true; this.resumeAfterPointer = false; }
-      else if (this.pointerWasLocked && this.phase === 'allez' && !this.resumeAfterPointer) this.pause();
+      const locked = document.pointerLockElement === this.scene2d.canvas;
+      if (locked) this.pointerWasLocked = true;
+      else if (this.pointerWasLocked && this.phase === 'allez') this.pause();
       if (!locked) this.pointerWasLocked = false;
     });
     document.addEventListener('mousemove', (event) => {
       if (this.phase !== 'allez') return;
-      if (document.pointerLockElement === this.renderer.domElement) {
+      if (document.pointerLockElement === this.scene2d.canvas) {
         this.player.aim.x = clamp(this.player.aim.x + event.movementX * 0.0021, -1, 1);
         this.player.aim.y = clamp(this.player.aim.y - event.movementY * 0.0021, -0.9, 1);
       } else {
-        const rect = this.renderer.domElement.getBoundingClientRect();
+        const rect = this.scene2d.canvas.getBoundingClientRect();
         this.player.aim.x = clamp(((event.clientX - rect.left) / rect.width - 0.5) * 2.2, -1, 1);
         this.player.aim.y = clamp((0.5 - (event.clientY - rect.top) / rect.height) * 2.2, -0.9, 1);
       }
       if (this.player.action.type !== 'parry') this.player.parry = this.parryFromAim(this.player.aim.x, this.player.aim.y);
     });
-    this.renderer.domElement.addEventListener('mousedown', (event) => {
+    this.scene2d.canvas.addEventListener('mousedown', (event) => {
       if (this.phase !== 'allez') return;
       if (!document.pointerLockElement) this.requestPointer();
       if (event.button === 0) this.startAttack(this.player, 'attack');
       if (event.button === 2) this.startParry(this.player);
       if (event.button === 1) this.startFeint(this.player);
     });
-    this.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
+    this.scene2d.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
   }
-
-  private resize = () => {
-    const width = this.container.clientWidth || window.innerWidth;
-    const height = this.container.clientHeight || window.innerHeight;
-    this.camera.aspect = width / height;
-    this.camera.updateProjectionMatrix();
-    this.renderer.setSize(width, height);
-  };
 
   private resetPositions() {
     const half = this.combatConfig.params.startingGap / 2;
     for (const fencer of [this.player, this.ai]) {
-      fencer.position.set(0, 0, fencer.side === 'player' ? half : -half);
+      fencer.position = v3(0, 0, fencer.side === 'player' ? half : -half);
+      (fencer.visual as unknown as { _z: number })._z = fencer.position.z;
       fencer.aim = { x: 0, y: 0 };
       fencer.action = idleAction();
       fencer.parry = 4;
@@ -292,16 +263,13 @@ export class FencingGame {
       fencer.moveDirection = 0;
       fencer.thinkIn = 0.35;
       this.calculateBlade(fencer);
-      fencer.previousTip.copy(fencer.bladeTip);
-      this.trailPoints[fencer.side] = [];
+      fencer.previousTip = { ...fencer.bladeTip };
     }
     this.pendingHits = [];
-    this.arena.setScoreLights('off', 'off');
+    this.scene2d.setScoreLights('off', 'off');
   }
 
-  setPreset(preset: CombatPreset) {
-    this.combatConfig.setPreset(preset);
-  }
+  setPreset(preset: CombatPreset) { this.combatConfig.setPreset(preset); }
 
   private beginPhase(phase: GamePhase, duration: number) {
     this.phase = phase;
@@ -316,20 +284,17 @@ export class FencingGame {
   private isAttacking(fencer: Fencer) {
     return ['attack', 'lunge', 'fleche'].includes(fencer.action.type);
   }
-
   private canAct(fencer: Fencer) {
     return ['idle', 'advance', 'retreat', 'glissade'].includes(fencer.action.type);
   }
 
   private startHalfstep(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
-    const p = this.combatConfig.params;
     const backward = fencer.side === 'player' && this.keys.has('KeyS');
     fencer.action = { ...idleAction(), type: 'halfstep', duration: 0.2 };
     fencer.moveDirection = backward ? -1 : 1;
     this.audio.step();
   }
-
   private startBallestra(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
     fencer.action = { ...idleAction(), type: 'ballestra', duration: 0.46 };
@@ -337,7 +302,6 @@ export class FencingGame {
     this.audio.step();
     this.emit('action', fencer.side, 'Ballestra', '跃步 · 可衔接弓步');
   }
-
   private startFeint(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
     const p = this.combatConfig.params;
@@ -346,7 +310,6 @@ export class FencingGame {
     this.audio.swish();
     this.emit('action', fencer.side, 'Feint', '佯攻 · 左键衔接转移进攻');
   }
-
   private startPrise(fencer: Fencer) {
     if (!this.canAct(fencer)) return;
     const opponent = this.opponent(fencer);
@@ -362,7 +325,6 @@ export class FencingGame {
     this.audio.blade();
     this.emit('blade', fencer.side, 'Prise de fer', 'Croisé · 剑刃控制成功，左键进攻');
   }
-
   private startParry(fencer: Fencer, forcedParry?: number) {
     if (!this.canAct(fencer) && fencer.action.type !== 'feint') return;
     const p = this.combatConfig.params;
@@ -372,7 +334,6 @@ export class FencingGame {
     fencer.action = { ...idleAction(), type: 'parry', duration: p.parryDuration, parry };
     this.emit('action', fencer.side, `Parry ${parry}`, PARRY_NAMES[parry - 1]);
   }
-
   private startAttack(fencer: Fencer, kind: 'attack' | 'lunge' | 'fleche') {
     const current = fencer.action;
     const p = this.combatConfig.params;
@@ -418,7 +379,6 @@ export class FencingGame {
     this.priority = side;
     if (side) this.emit('priority', side, 'Right of Way', `${side === 'player' ? '你' : '对手'}持有优先权`);
   }
-
   private setAimForParry(fencer: Fencer, parry: number) {
     const aims: Record<number, [number, number]> = {
       1: [-0.85, -0.65], 2: [0.85, -0.65], 3: [0.52, 0], 4: [-0.3, 0],
@@ -428,7 +388,6 @@ export class FencingGame {
     fencer.aim.x = x;
     fencer.aim.y = y;
   }
-
   private parryFromAim(x: number, y: number) {
     if (y > 0.34) return x < 0 ? 6 : 5;
     if (y < -0.34) {
@@ -439,7 +398,6 @@ export class FencingGame {
     }
     return x < 0 ? 4 : 3;
   }
-
   private opponent(fencer: Fencer) { return fencer.side === 'player' ? this.ai : this.player; }
   private bodyDistance() { return Math.abs(this.player.position.z - this.ai.position.z); }
 
@@ -448,12 +406,15 @@ export class FencingGame {
     const sign = fencer.side === 'player' ? -1 : 1;
     fencer.position.z += sign * direction * amount;
     fencer.position.z = clamp(fencer.position.z, -6.65, 6.65);
+    (fencer.visual as unknown as { _z: number })._z = fencer.position.z;
     const distance = this.bodyDistance();
     const minGap = this.combatConfig.params.minBodyGap;
     if (distance < minGap) {
       const midpoint = (this.player.position.z + this.ai.position.z) / 2;
       this.player.position.z = midpoint + minGap / 2;
       this.ai.position.z = midpoint - minGap / 2;
+      (this.player.visual as unknown as { _z: number })._z = this.player.position.z;
+      (this.ai.visual as unknown as { _z: number })._z = this.ai.position.z;
     }
   }
 
@@ -605,47 +566,45 @@ export class FencingGame {
     const action = fencer.action;
     const lungeLean = action.type === 'lunge' ? Math.sin(clamp(action.elapsed / action.duration, 0, 1) * Math.PI) * 0.18 : 0;
     const sideSign = fencer.side === 'player' ? 1 : -1;
-    fencer.bladeBase.set(
-      fencer.position.x + sideSign * (0.25 + fencer.aim.x * 0.045),
-      1.25 + fencer.extension * 0.07 + lungeLean * 0.15,
-      fencer.position.z + forward * (0.42 + fencer.extension * 0.37 + lungeLean),
-    );
+    fencer.bladeBase = {
+      x: fencer.position.x + sideSign * (0.25 + fencer.aim.x * 0.045),
+      y: 1.25 + fencer.extension * 0.07 + lungeLean * 0.15,
+      z: fencer.position.z + forward * (0.42 + fencer.extension * 0.37 + lungeLean),
+    };
     const length = this.config.weapon === 'sabre' ? 0.88 : 0.92;
-    const direction = new THREE.Vector3(fencer.aim.x * 0.68 * sideSign, fencer.aim.y * 0.62, forward).normalize();
+    let direction: V3 = v3Norm({ x: fencer.aim.x * 0.68 * sideSign, y: fencer.aim.y * 0.62, z: forward });
     if (action.type === 'parry') {
       direction.x += (fencer.parry % 2 === 0 ? -0.15 : 0.15) * sideSign;
-      direction.normalize();
+      direction = v3Norm(direction);
     }
     if (this.config.weapon === 'sabre' && this.isAttacking(fencer) && action.elapsed > action.hitAt * 0.5) {
       const cut = Math.sin(clamp((action.elapsed - action.hitAt * 0.5) / 0.28, 0, 1) * Math.PI);
-      direction.x += cut * 0.48 * sideSign;
-      direction.y += cut * 0.12;
-      direction.normalize();
+      direction = v3Norm({ x: direction.x + cut * 0.48 * sideSign, y: direction.y + cut * 0.12, z: direction.z });
     }
-    fencer.bladeTip.copy(fencer.bladeBase).addScaledVector(direction, length);
+    fencer.bladeTip = v3AddScaled(fencer.bladeBase, direction, length);
   }
 
   private bodyTargets(fencer: Fencer): BodyTarget[] {
     const p = fencer.position;
     const forward = fencer.side === 'player' ? -1 : 1;
     return [
-      { center: new THREE.Vector3(p.x, 1.26, p.z), radius: 0.285, name: '躯干', region: 'torso' },
-      { center: new THREE.Vector3(p.x, 1.64, p.z + forward * 0.03), radius: 0.18, name: '面罩 / 头部', region: 'head' },
-      { center: new THREE.Vector3(p.x + (fencer.side === 'player' ? 0.25 : -0.25), 1.27, p.z + forward * 0.38), radius: 0.14, name: '持剑手臂', region: 'arm' },
-      { center: new THREE.Vector3(p.x, 0.69, p.z), radius: 0.25, name: '腿部', region: 'leg' },
-      { center: new THREE.Vector3(p.x, 0.18, p.z + forward * 0.22), radius: 0.18, name: '脚部', region: 'leg' },
+      { center: v3(p.x, 1.26, p.z), radius: 0.285, name: '躯干', region: 'torso' },
+      { center: v3(p.x, 1.64, p.z + forward * 0.03), radius: 0.18, name: '面罩 / 头部', region: 'head' },
+      { center: v3(p.x + (fencer.side === 'player' ? 0.25 : -0.25), 1.27, p.z + forward * 0.38), radius: 0.14, name: '持剑手臂', region: 'arm' },
+      { center: v3(p.x, 0.69, p.z), radius: 0.25, name: '腿部', region: 'leg' },
+      { center: v3(p.x, 0.18, p.z + forward * 0.22), radius: 0.18, name: '脚部', region: 'leg' },
     ];
   }
 
-  private pointSegmentDistance(point: THREE.Vector3, a: THREE.Vector3, b: THREE.Vector3) {
-    const ab = b.clone().sub(a);
-    const lengthSq = ab.lengthSq();
-    if (!lengthSq) return point.distanceTo(a);
-    const t = clamp(point.clone().sub(a).dot(ab) / lengthSq, 0, 1);
-    return point.distanceTo(a.clone().addScaledVector(ab, t));
+  private pointSegmentDistance(point: V3, a: V3, b: V3) {
+    const ab = v3Sub(b, a);
+    const lenSq = v3Len(ab) ** 2;
+    if (!lenSq) return v3Dist(point, a);
+    const t = clamp(v3Dist(point, a) < v3Dist(point, b) ? v3Sub(point, a).x * ab.x + v3Sub(point, a).y * ab.y + v3Sub(point, a).z * ab.z : 0, 0, 1);
+    return v3Dist(point, v3AddScaled(a, ab, t));
   }
 
-  private segmentDistance(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3) {
+  private segmentDistance(a: V3, b: V3, c: V3, d: V3) {
     return Math.min(
       this.pointSegmentDistance(a, c, d), this.pointSegmentDistance(b, c, d),
       this.pointSegmentDistance(c, a, b), this.pointSegmentDistance(d, a, b),
@@ -669,8 +628,6 @@ export class FencingGame {
         defender.stats.parries++;
         if (this.config.weapon !== 'epee') this.setPriority(defender.side);
         this.audio.blade();
-        this.clashLight.position.copy(attacker.bladeTip).lerp(defender.bladeTip, 0.5);
-        this.clashLight.intensity = 7;
         this.emit('parry', defender.side, `Parry ${pa.parry} · ${defender.side === 'player' ? '格挡成功' : '对手格挡'}`, this.config.weapon === 'epee' ? 'Riposte 窗口已开启' : '优先权转移 · 现在反击');
         return;
       }
@@ -687,7 +644,7 @@ export class FencingGame {
     const validTarget = this.config.weapon === 'epee' || (this.config.weapon === 'foil' ? contact.region === 'torso' : contact.region !== 'leg');
     if (!validTarget) {
       this.audio.hit(false);
-      this.arena.setScoreLights(attacker.side === 'player' ? 'white' : 'off', attacker.side === 'ai' ? 'white' : 'off');
+      this.scene2d.setScoreLights(attacker.side === 'player' ? 'white' : 'off', attacker.side === 'ai' ? 'white' : 'off');
       this.emit('invalid', attacker.side, '白灯 · 无效部位', `${contact.name}不在${WEAPON_INFO[this.config.weapon].name}有效部位内`, false);
       this.beginPhase('halt', 2.1);
       return;
@@ -700,9 +657,6 @@ export class FencingGame {
     this.pendingHits.push({ side: attacker.side, at: this.elapsed, target: contact.name });
     attacker.stats.hits++;
     this.audio.hit(true);
-    this.clashLight.position.copy(attacker.bladeTip);
-    this.clashLight.color.set(attacker.side === 'player' ? '#b8f34a' : '#ef5c4d');
-    this.clashLight.intensity = 5;
     this.emit('hit', attacker.side, this.config.weapon === 'sabre' ? 'Touché · 劈中' : 'Touché · 刺中', `${contact.name} · ${this.config.weapon === 'epee' ? '有效命中' : '优先权有效'}`, true);
     if (this.config.weapon !== 'epee') this.resolveHits();
   }
@@ -716,7 +670,7 @@ export class FencingGame {
     for (const side of winners) this.score[side]++;
     const playerLight = winners.includes('player') ? 'green' : 'off';
     const aiLight = winners.includes('ai') ? 'red' : 'off';
-    this.arena.setScoreLights(playerLight, aiLight);
+    this.scene2d.setScoreLights(playerLight, aiLight);
     this.pendingHits = [];
     const double = winners.length === 2;
     this.emit('score', winners[0], double ? 'Double Touché · 双方得分' : `${winners[0] === 'player' ? '你' : '对手'}得分`, `${this.score.player} : ${this.score.ai}`, true);
@@ -760,33 +714,6 @@ export class FencingGame {
     this.emit('phase', undefined, playerWon ? 'Victoire · 胜利' : 'Match Terminé · 比赛结束', `最终比分 ${this.score.player} : ${this.score.ai}`);
   }
 
-  private updateCamera(dt: number) {
-    const targetBlend = this.view === 'first' ? 1 : 0;
-    this.viewBlend += (targetBlend - this.viewBlend) * Math.min(1, dt * 8);
-    if (this.phase === 'menu') {
-      const angle = this.elapsed * 0.075;
-      this.camera.position.set(4.5 + Math.sin(angle) * 0.35, 2.35, 4.9 + Math.cos(angle) * 0.3);
-      this.camera.lookAt(0.2, 1.05, -0.15);
-      this.camera.fov += (50 - this.camera.fov) * dt * 3;
-      this.camera.updateProjectionMatrix();
-      return;
-    }
-    const playerHead = new THREE.Vector3(this.player.position.x, 1.61, this.player.position.z - 0.035);
-    const opponentLook = new THREE.Vector3(this.ai.position.x + this.player.aim.x * 0.3, 1.29 + this.player.aim.y * 0.35, this.ai.position.z);
-    const thirdPosition = new THREE.Vector3(this.player.position.x + 2.75, 2.45, this.player.position.z + 3.65);
-    if (this.bodyDistance() < 1.2) thirdPosition.x += 0.5;
-    const thirdLook = new THREE.Vector3(this.ai.position.x * 0.35, 1.12, this.ai.position.z * 0.62);
-    const firstDirection = opponentLook.sub(playerHead).normalize();
-    const firstPosition = playerHead.clone().addScaledVector(firstDirection, 0.04);
-    const position = thirdPosition.lerp(firstPosition, this.viewBlend);
-    this.camera.position.lerp(position, Math.min(1, dt * 13));
-    const look = thirdLook.lerp(new THREE.Vector3(this.ai.position.x + this.player.aim.x * 0.65, 1.3 + this.player.aim.y * 0.65, this.ai.position.z), this.viewBlend);
-    this.camera.lookAt(look);
-    const desiredFov = this.view === 'first' ? 68 : 54;
-    this.camera.fov += (desiredFov - this.camera.fov) * Math.min(1, dt * 8);
-    this.camera.updateProjectionMatrix();
-  }
-
   private updateVisuals(dt: number) {
     for (const fencer of [this.player, this.ai]) {
       const snapshot: FencerSnapshot = {
@@ -796,19 +723,13 @@ export class FencingGame {
         parry: fencer.parry,
         bladeTip: { x: fencer.bladeTip.x, y: fencer.bladeTip.y, z: fencer.bladeTip.z },
         bladeBase: { x: fencer.bladeBase.x, y: fencer.bladeBase.y, z: fencer.bladeBase.z },
-        speed: fencer.speed, viewMode: this.view,
+        speed: fencer.speed, viewMode: this.view, weapon: this.config.weapon,
       };
       fencer.visual.update(snapshot, dt, this.view);
-      const points = this.trailPoints[fencer.side];
-      if (this.isAttacking(fencer) || fencer.action.type === 'feint') {
-        points.push(fencer.bladeTip.clone());
-        if (points.length > 16) points.shift();
-      } else if (points.length) points.shift();
-      this.trails[fencer.side].geometry.setFromPoints(points);
-      this.trails[fencer.side].visible = points.length > 1;
+      // 保存 z 位置给 drawFencer
+      (fencer.visual as unknown as { _z: number })._z = fencer.position.z;
     }
-    this.clashLight.intensity *= Math.pow(0.015, dt);
-    this.arena.update(this.elapsed);
+    this.scene2d.update(dt);
   }
 
   private publish() {
@@ -853,7 +774,7 @@ export class FencingGame {
     }
 
     for (const fencer of [this.player, this.ai]) {
-      fencer.previousTip.copy(fencer.bladeTip);
+      fencer.previousTip = { ...fencer.bladeTip };
       this.calculateBlade(fencer);
     }
     if (this.phase === 'allez') {
@@ -866,7 +787,9 @@ export class FencingGame {
   private loop = () => {
     if (this.destroyed) return;
     this.animationFrame = requestAnimationFrame(this.loop);
-    const renderDt = Math.min(this.clock.getDelta(), 0.5);
+    const now = performance.now();
+    const renderDt = Math.min((now - this.lastTime) / 1000, 0.1);
+    this.lastTime = now;
     if (this.phase === 'pause') {
       this.accumulator = 0;
     } else {
@@ -878,8 +801,7 @@ export class FencingGame {
       }
     }
     this.updateVisuals(renderDt);
-    this.updateCamera(renderDt);
-    this.renderer.render(this.scene, this.camera);
+    this.scene2d.draw(this.player.visual, this.ai.visual, this.bodyDistance(), this.config.assists, this.phase, this.view, renderDt);
     this.uiElapsed += renderDt;
     if (this.uiElapsed > 0.045) { this.publish(); this.uiElapsed = 0; }
   };
@@ -887,10 +809,9 @@ export class FencingGame {
   destroy() {
     this.destroyed = true;
     cancelAnimationFrame(this.animationFrame);
-    window.removeEventListener('resize', this.resize);
+    window.removeEventListener('resize', this.resizeHandler);
     this.player.visual.dispose();
     this.ai.visual.dispose();
-    this.renderer.dispose();
-    this.renderer.domElement.remove();
+    this.scene2d.dispose();
   }
 }

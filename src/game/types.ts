@@ -28,6 +28,7 @@ export interface ActionState {
 
 export interface FencerSnapshot {
   side: Side;
+  weapon: Weapon;
   position: { x: number; y: number; z: number };
   aim: { x: number; y: number };
   action: ActionState;
